@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Extract release number and serial from Blorb, Z-code, Glulx, ADRIFT, or TADS.
+"""Extract release number and serial from IF story files.
 
 Accepts bare Z-code (.z3–.z8, etc.), Inform Glulx (.ulx), TADS 2/3
-(.gam / .t3), ADRIFT .taf (3.7–5), and Blorbs.
+(.gam / .t3), ADRIFT .taf (3.7–5), Quest .quest packages, and Blorbs.
 
 Serial number is a YYMMDD date. Bare ADRIFT .taf files have no release
 number (only serial from CompileDate / LastUpdated). TADS stories without
 GameInfo use the image header compile timestamp as serial only.
+
+Quest .quest packages use iFiction releasedate or the ZIP last-mod date
+of game.aslx.
 
 For Blorbs, the first source that yields a result wins, in this order:
 
@@ -31,8 +34,10 @@ import re
 import struct
 import sys
 import xml.etree.ElementTree as ET
+import zipfile
 import zlib
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 
@@ -680,6 +685,76 @@ def _from_taf(data: bytes) -> tuple[int | None, str | None]:
     raise ExtractError("not an ADRIFT 3.7–5 taf")
 
 
+# --- Quest (.quest) --------------------------------------------------------
+
+def _zip_namelist_lower(zf: zipfile.ZipFile) -> dict[str, str]:
+    """Map lowercased member names to the actual ZipInfo filenames."""
+    return {name.lower(): name for name in zf.namelist()}
+
+
+def _is_quest_package(data: bytes) -> bool:
+    """True if data is a ZIP whose root contains game.aslx (a .quest package)."""
+    if len(data) < 30 or data[0:4] != b"PK\x03\x04":
+        return False
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as zf:
+            return "game.aslx" in _zip_namelist_lower(zf)
+    except zipfile.BadZipFile:
+        return False
+
+
+def _zip_member(data: bytes, name: str) -> bytes | None:
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as zf:
+            names = _zip_namelist_lower(zf)
+            actual = names.get(name.lower())
+            if actual is None:
+                return None
+            return zf.read(actual)
+    except zipfile.BadZipFile:
+        return None
+
+
+def _zip_entry_ymd(data: bytes, name: str) -> str | None:
+    """YYYY-MM-DD from a ZIP member's DOS last-mod date (babel zip_entry_ymd)."""
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as zf:
+            names = _zip_namelist_lower(zf)
+            actual = names.get(name.lower())
+            if actual is None:
+                return None
+            info = zf.getinfo(actual)
+    except zipfile.BadZipFile:
+        return None
+    year, month, day = info.date_time[0], info.date_time[1], info.date_time[2]
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _from_quest_package(data: bytes) -> tuple[int | None, str | None]:
+    """Release/serial from a .quest ZIP: iFiction attached release, else game.aslx date."""
+    ifmd = _zip_member(data, "metadata.iFiction")
+    if ifmd is not None:
+        try:
+            story = _parse_ifmd(ifmd)
+        except ExtractError:
+            story = None
+        if story is not None:
+            got = _from_attached_release(story)
+            if got is not None:
+                return got
+
+    ymd = _zip_entry_ymd(data, "game.aslx")
+    if ymd is not None:
+        serial = _serial_from_releasedate(ymd)
+        if serial is not None:
+            return None, serial
+    raise ExtractError(
+        "Quest package has no iFiction releasedate or game.aslx ZIP date"
+    )
+
+
 def _from_blorb(data: bytes) -> tuple[int | None, str | None]:
     chunk_type, exec_payload = _blorb_exec(data)
 
@@ -723,6 +798,8 @@ def release_and_serial(path: Path) -> tuple[int | None, str | None]:
     data = path.read_bytes()
     if _is_blorb(data):
         return _from_blorb(data)
+    if _is_quest_package(data):
+        return _from_quest_package(data)
     if _is_adrift_taf(data):
         return _from_taf(data)
     if _is_tads3(data) or _is_tads2(data):
@@ -733,7 +810,7 @@ def release_and_serial(path: Path) -> tuple[int | None, str | None]:
         return _from_zcode(data)
     raise ExtractError(
         "unsupported file type "
-        "(need Z-code, Inform Glulx, TADS, ADRIFT .taf, "
+        "(need Z-code, Inform Glulx, TADS, ADRIFT .taf, Quest .quest, "
         "or Blorb with ZCOD / GLUL / ADRI / TAD2 / TAD3)"
     )
 
@@ -742,13 +819,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Print release number and/or serial from a Z-code, Inform Glulx, "
-            "TADS, or ADRIFT story file, or a Blorb containing those formats."
+            "TADS, ADRIFT, or Quest .quest story file, or a Blorb containing "
+            "those formats."
         )
     )
     parser.add_argument(
         "path",
         type=Path,
-        help="story file (.z*, .ulx, .t3, .gam, .taf, .blorb, .gblorb, …)",
+        help=(
+            "story file (.z*, .ulx, .t3, .gam, .taf, .quest, "
+            ".blorb, .gblorb, …)"
+        ),
     )
     args = parser.parse_args(argv)
 
